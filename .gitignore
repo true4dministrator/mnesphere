@@ -1,0 +1,13 @@
+node_modules
+dist
+.DS_Store
+*.local
+.vite
+
+# Rust / Tauri 产物
+src-tauri/target
+src-tauri/gen
+
+# 开发过程的构建日志与工作记录（不属于产品源码）
+.workbuddy/build-logs
+.workbuddy/memory
