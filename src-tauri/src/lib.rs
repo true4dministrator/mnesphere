@@ -324,6 +324,10 @@ pub fn run() {
             ai::ai_chat,
             ai::ai_test,
             // GitHub
+            github::github_account,
+            github::github_create_repo,
+            github::github_pull,
+            github::github_status,
             github::github_test,
             github::github_sync,
         ])

@@ -1,7 +1,7 @@
 {
   "name": "mnesphere",
   "private": true,
-  "version": "0.2.2",
+  "version": "0.2.4",
   "type": "module",
   "description": "本地优先的个人知识球 —— 日记 / 打卡 / Obsidian 式笔记，全部以 Markdown 存储",
   "scripts": {

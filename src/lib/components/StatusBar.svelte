@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Icon from './Icons.svelte';
-  import { ai, cfg, checkin, doc, stats, tasks, ui } from '../state.svelte';
+  import { openExternal } from '../api';
+  import { ai, checkin, doc, gh, stats, tasks, ui } from '../state.svelte';
+  import { relTime } from '../time';
 
   const LABEL: Record<string, string> = {
     diary: '日记',
@@ -48,16 +51,33 @@
     checkin.focus !== 'all' && checkin.stats ? checkin.stats.currentStreak : 0
   );
 
-  /** lastSync 后端存的是 ISO 字符串，这里只做展示层的轻度裁剪 */
-  function shortTime(v: string): string {
-    if (!v) return '';
-    const d = new Date(v);
-    if (Number.isNaN(d.getTime())) return v;
-    const p = (n: number) => String(n).padStart(2, '0');
-    return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  }
+  /** 驱动相对时间刷新（每 30 秒动一次），否则「3 分钟前」会一直停在「3 分钟前」 */
+  let now = $state(Date.now());
+  onMount(() => {
+    const id = setInterval(() => (now = Date.now()), 30_000);
+    return () => clearInterval(id);
+  });
 
-  const gh = $derived(cfg.current?.github);
+  /**
+   * 状态栏那一格 GitHub 的显示内容。null = 没配仓库，整格退化成一个灰字。
+   *
+   * 三种状态：
+   *   · 有未推的改动 → 黄点 + 相对时间（提示该点同步了）
+   *   · 已同步       → 常规色 + 相对时间
+   *   · 从没同步过   → 「未同步」
+   */
+  const ghCell = $derived.by(() => {
+    const s = gh.stat;
+    if (!s || !s.configured) return null;
+    return {
+      url: s.url,
+      dirty: s.dirty,
+      label: s.lastSync ? relTime(s.lastSync, now) : '未同步',
+      tip: s.dirty
+        ? `有改动还没推上去${s.lastCommit ? `（上次提交 ${s.lastCommit.slice(0, 7)}）` : ''} · 点击打开仓库`
+        : `${s.lastSync ? `上次同步 ${s.lastSync}` : '还没同步过'} · 点击打开仓库`
+    };
+  });
   const saveLabel = $derived(
     doc.saving ? '保存中' : doc.dirty ? '未保存' : doc.data ? '已保存' : ''
   );
@@ -138,10 +158,24 @@
       AI
     </span>
 
-    <span class="item {gh?.repo ? 'ok' : 'muted'}" title={gh?.lastCommit ? `上次提交 ${gh.lastCommit}` : 'GitHub 未配置'}>
-      <Icon name="github" size={12} />
-      {#if gh?.lastSync}{shortTime(gh.lastSync)}{:else}{gh?.repo ? '未同步' : '未配置'}{/if}
-    </span>
+    {#if ghCell}
+      <button
+        class="item ghitem"
+        class:ok={!ghCell.dirty}
+        class:dirty={ghCell.dirty}
+        title={ghCell.tip}
+        onclick={() => void openExternal(ghCell.url)}
+      >
+        <Icon name="github" size={12} />
+        {#if ghCell.dirty}<s class="gdot"></s>{/if}
+        {ghCell.label}
+      </button>
+    {:else}
+      <span class="item muted" title="GitHub 未配置">
+        <Icon name="github" size={12} />
+        未配置
+      </span>
+    {/if}
   </div>
 </footer>
 
@@ -300,6 +334,30 @@
   }
   .taskitem.danger em {
     color: var(--danger);
+  }
+
+  /* 状态栏里的 GitHub 格子是个可点入口（打开仓库），别看着像纯文本 */
+  .ghitem {
+    height: 18px;
+    padding: 0 7px;
+    border-radius: 9px;
+    gap: 4px;
+  }
+  .ghitem:hover {
+    background: var(--hover);
+    color: var(--fg);
+  }
+  .ghitem.dirty {
+    color: var(--warn);
+  }
+  /* 「有改动还没推」的小黄点，跟文档「未保存」那个点同一个呼吸节奏 */
+  .ghitem .gdot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--warn);
+    text-decoration: none;
+    animation: breath 1.5s ease-in-out infinite;
   }
 
   @keyframes breath {

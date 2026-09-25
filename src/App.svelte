@@ -29,8 +29,10 @@
     focusSearch,
     notes,
     openCtxMenu,
+    pullGhStatus,
     refreshAll,
     refreshCheckin,
+    reloadConfig,
     saveConfig,
     tasks,
     toast,
@@ -151,10 +153,16 @@
     return { samples: [], extra: PANEL_EXTRA_TASK };
   }
 
+  /** 周期性拉 GitHub 同步状态 —— 状态栏得知道「有没有还没推上去的改动」 */
+  let ghTimer: ReturnType<typeof setInterval> | undefined;
+
   onMount(async () => {
     onResize();
     window.addEventListener('resize', onResize);
     await bootstrap();
+    // 状态栏那格 GitHub 需要的「配没配 / 有没有没推的改动」
+    void pullGhStatus();
+    ghTimer = setInterval(() => void pullGhStatus(), 30_000);
 
     unlisteners.push(
       await listen<string[]>('vault-changed', async (ev) => {
@@ -166,6 +174,8 @@
           doc.data = d;
         }
         await refreshAll();
+        // 内容刚变过 → 状态栏那个黄点该亮起来了
+        void pullGhStatus();
       })
     );
 
@@ -212,6 +222,7 @@
 
   onDestroy(() => {
     unlisteners.forEach((u) => u());
+    if (ghTimer) clearInterval(ghTimer);
     window.removeEventListener('keydown', onKey);
     window.removeEventListener('contextmenu', onContextMenu);
     window.removeEventListener('resize', onResize);
@@ -236,10 +247,17 @@
     }
     toast('正在同步到 GitHub…');
     try {
-      const r = await api.githubSync();
+      // 正在编辑、还没保存的文档交给后端「只读」处理 ——
+      // 内存里那份才是你眼下的真实意图，不该被远端内容盖掉
+      const protect = doc.path && doc.dirty ? [doc.path] : [];
+      const r = await api.githubSync(protect);
       toast(`${r.message}（commit ${r.commit || '无'}）`, 'ok');
     } catch (e) {
       toast(typeof e === 'string' ? e : String(e), 'error');
+    } finally {
+      // 后端刚写过 lastSync / lastCommit —— 不回读的话状态栏还停在旧值上
+      await reloadConfig();
+      await pullGhStatus();
     }
   }
 

@@ -5,6 +5,7 @@ import type {
   AppConfig,
   DiaryMonth,
   DocContent,
+  GhStatus,
   Habit,
   HabitStats,
   IndexStats,
@@ -52,6 +53,15 @@ export function closeWelcome() {
 
 export const cfg = $state({
   current: null as AppConfig | null
+});
+
+/**
+ * GitHub 同步状态。状态栏和设置页都要读，所以挂在全局而不是某个组件里。
+ *
+ * `dirty`（有没有没推上去的改动）由后端按 mtime 算，这里只负责缓存和拉取时机。
+ */
+export const gh = $state({
+  stat: null as GhStatus | null
 });
 
 export const doc = $state({
@@ -381,6 +391,38 @@ export async function saveConfig(patch: Partial<AppConfig>) {
     applyTheme(cfg.current.theme);
   } catch (e) {
     toast(errText(e), 'error');
+  }
+}
+
+/**
+ * 只把后端配置**回读**一遍，不做任何写回。
+ *
+ * 同步 / 建仓库这类「后端自己会改配置」的操作之后必须调它 —— 否则界面读的还是
+ * 内存里那份过期快照（典型症状：「上次同步」永远显示「从未」）。
+ *
+ * ⚠️ 别图省事拿 `saveConfig({})` 代替：那是**全量提交**，会把后端刚写好的
+ * lastSync / lastCommit 用前端的过期值覆盖掉。后端 `set_config` 现在会挡这两
+ * 个字段，但仍不该把回读这件事交给一条写路径去做。
+ */
+export async function reloadConfig() {
+  try {
+    cfg.current = await api.getConfig();
+  } catch (e) {
+    toast(errText(e), 'error');
+  }
+}
+
+/**
+ * 拉一次 GitHub 同步状态（配没配 / 有没有未同步的改动 / 上次同步时间）。
+ *
+ * 刻意**不弹错**：状态栏是个被动显示区，Token 被清掉之类的异常情况让它安静地
+ * 空着就好 —— 每次轮询都糊用户一脸红字，比不显示更烦人。
+ */
+export async function pullGhStatus() {
+  try {
+    gh.stat = await api.githubStatus();
+  } catch {
+    gh.stat = null;
   }
 }
 

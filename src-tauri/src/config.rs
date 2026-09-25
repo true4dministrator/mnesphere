@@ -143,7 +143,6 @@ pub struct GithubConfig {
     /// owner/repo
     pub repo: String,
     pub branch: String,
-    pub auto_sync: bool,
     pub last_sync: String,
     pub last_commit: String,
 }
@@ -153,7 +152,6 @@ impl Default for GithubConfig {
         Self {
             repo: String::new(),
             branch: "main".into(),
-            auto_sync: false,
             last_sync: String::new(),
             last_commit: String::new(),
         }
@@ -361,9 +359,18 @@ pub fn get_config(state: tauri::State<'_, crate::AppState>) -> AppConfig {
 pub fn set_config(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
-    config: AppConfig,
+    mut config: AppConfig,
 ) -> Result<AppConfig, String> {
-    let old_vault = state.cfg.lock().unwrap().vault.clone();
+    let old_vault = {
+        let g = state.cfg.lock().unwrap();
+        // `last_sync` / `last_commit` 是**运行态字段** —— 只有同步流程会写它们。
+        // 前端手上那份配置是异步拉来的快照，这两个字段很可能已经过期：
+        // 用户同步完（后端写了新时间）之后再随便改个设置，前端就会把它抹回空。
+        // 所以这里一律以服务端内存值为准，不接受前端传来的这两个值。
+        config.github.last_sync = g.github.last_sync.clone();
+        config.github.last_commit = g.github.last_commit.clone();
+        g.vault.clone()
+    };
     config.save()?;
     {
         let mut g = state.cfg.lock().unwrap();

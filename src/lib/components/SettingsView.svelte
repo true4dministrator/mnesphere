@@ -3,8 +3,9 @@
   import Icon from './Icons.svelte';
   import * as api from '../api';
   import type { PresetInfoLike, SyncReport } from '../api';
-  import { ai, applyNoteSort, cfg, refreshAll, saveConfig, toast, ui } from '../state.svelte';
+  import { ai, applyNoteSort, cfg, doc, refreshAll, reloadConfig, saveConfig, toast, ui } from '../state.svelte';
   import type { SettingsTab } from '../state.svelte';
+  import { relTime } from '../time';
   import { applyTheme } from '../theme';
 
   /** 顶栏标题跟着左栏导航走，让人一眼知道自己在哪一区 */
@@ -30,9 +31,19 @@
   let report = $state<SyncReport | null>(null);
   let autostart = $state(false);
 
+  // ── GitHub 卡片的局部状态 ──
+  /** 仓库连通性。empty = 仓库存在但一个提交都没有（**不是错误**，首次同步会自动建）。 */
+  let ghState = $state<'idle' | 'ok' | 'empty' | 'missing'>('idle');
+  /** 当前 Token 属于谁、带什么权限 —— 配错了用户自己能看出来 */
+  let ghAcc = $state<api.AccountInfo | null>(null);
+  /** 「仓库不存在」时用来建仓库的名字 */
+  let newRepoName = $state('');
+  /** 驱动相对时间刷新（每 30 秒动一次），否则「3 分钟前」会一直停在「3 分钟前」 */
+  let now = $state(Date.now());
+
   const t = $derived(cfg.current?.theme);
 
-  onMount(async () => {
+  async function loadSettings() {
     presets = await api.themePresets();
     aiHas = await api.secretHas('ai_api_key');
     ghHas = await api.secretHas('github_token');
@@ -42,6 +53,16 @@
     } catch {
       autostart = false;
     }
+    // 顺手问一下「这个 Token 是谁的」——失败无所谓，卡片里少显示一行而已
+    if (ghHas) ghAcc = await api.githubAccount().catch(() => null);
+  }
+
+  // ⚠️ 别把 onMount 的回调写成 async：那样返回的是 Promise，Svelte 认不出真正的
+  // cleanup（类型上也会直接报错）。所以异步加载单独拎出来，回调本身保持同步。
+  onMount(() => {
+    void loadSettings();
+    const id = setInterval(() => (now = Date.now()), 30_000);
+    return () => clearInterval(id);
   });
 
   /** 改主题时立刻预览，不等到点保存 */
@@ -96,11 +117,58 @@
     }
   }
 
+  /** 从「GitHub 网址 / owner/repo / 纯仓库名」里抠出仓库名，用于预填建仓库输入框 */
+  function repoNameOf(v: string): string {
+    const s = v.trim().replace(/\.git$/i, '').replace(/\/+$/, '');
+    const parts = s.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] ?? '' : '';
+  }
+
   async function testGh() {
     busy = 'gh';
+    ghState = 'idle';
     try {
       const r = await api.githubTest(cfg.current!.github.repo, cfg.current!.github.branch);
-      toast(`连通：${r.fullName}（默认分支 ${r.defaultBranch}，${r.private ? '私有' : '公开'}）`, 'ok');
+      // 后端已经把用户粘的网址归一过了 —— 用官方拼写回写配置，顺手把格式纠正掉
+      if (r.fullName && r.fullName !== cfg.current!.github.repo) {
+        await saveConfig({ github: { ...cfg.current!.github, repo: r.fullName } });
+      }
+      ghState = r.empty ? 'empty' : 'ok';
+      toast(
+        r.empty
+          ? `${r.fullName} 目前是空仓库 —— 直接点「立即同步」，第一个提交会自动建好。`
+          : `连通：${r.fullName}（分支 ${cfg.current!.github.branch || r.defaultBranch}，${r.private ? '私有' : '公开'}）`,
+        'ok'
+      );
+    } catch (e) {
+      const msg = typeof e === 'string' ? e : String(e);
+      // 404 的语义是「这个仓库不存在」。与其把错误摔在用户脸上，不如递一条出路。
+      // （后端 404 的文案固定带 `（404）`，这里靠它分流。）
+      if (msg.includes('404')) {
+        ghState = 'missing';
+        newRepoName = repoNameOf(cfg.current!.github.repo);
+      }
+      toast(msg, 'error');
+    } finally {
+      busy = '';
+      await reloadConfig();
+    }
+  }
+
+  async function createRepo() {
+    const name = newRepoName.trim();
+    if (!name) return;
+    busy = 'create';
+    try {
+      const r = await api.githubCreateRepo(name);
+      // 建完直接写进配置 —— 用户的意图就是「用这个仓库」，不必再让他手动填一遍
+      await saveConfig({
+        github: { ...cfg.current!.github, repo: r.fullName, branch: r.defaultBranch || 'main' }
+      });
+      ghState = 'empty';
+      toast(`已建好私有仓库 ${r.fullName}，正在推第一批文件…`, 'ok');
+      // 建完立刻推一次，省掉「还得自己再点一下同步」这一步
+      await doSync();
     } catch (e) {
       toast(typeof e === 'string' ? e : String(e), 'error');
     } finally {
@@ -108,16 +176,40 @@
     }
   }
 
+  /** 正在编辑、还没保存的文档 —— 后端对它们只读不写，免得把刚敲的字盖掉 */
+  function protectList(): string[] {
+    return doc.path && doc.dirty ? [doc.path] : [];
+  }
+
   async function doSync() {
     busy = 'sync';
     report = null;
     try {
-      report = await api.githubSync();
+      report = await api.githubSync(protectList());
+      ghState = 'ok';
       toast(report.message, 'ok');
     } catch (e) {
       toast(typeof e === 'string' ? e : String(e), 'error');
     } finally {
       busy = '';
+      // 后端刚写过 lastSync / lastCommit —— 不回读的话界面会一直显示「从未」
+      await reloadConfig();
+    }
+  }
+
+  /** 只下载：把远端更新并进本地，一个字节都不往远端写 */
+  async function doPull() {
+    busy = 'pull';
+    report = null;
+    try {
+      report = await api.githubPull(protectList());
+      ghState = 'ok';
+      toast(report.message, 'ok');
+    } catch (e) {
+      toast(typeof e === 'string' ? e : String(e), 'error');
+    } finally {
+      busy = '';
+      await reloadConfig();
     }
   }
 
@@ -501,20 +593,84 @@
 
         <div class="statusline">
           <span class="badge" class:ok={ghHas}>{ghHas ? 'Token 已配置' : 'Token 未配置'}</span>
-          <span class="mono dim ellip">
-            {cfg.current.github.repo || '未指定仓库'} · {cfg.current.github.branch || 'main'}
-          </span>
+          {#if ghAcc}
+            <span class="dim">
+              账号 <b>{ghAcc.login}</b>{#if ghAcc.scopes.length}· 权限 {ghAcc.scopes.join(' ')}{/if}
+            </span>
+          {/if}
         </div>
 
         <div class="statusline">
           <button class="btn sm" disabled={busy === 'gh'} onclick={testGh}>
             {busy === 'gh' ? '检查中…' : '检查连通性'}
           </button>
-          <button class="btn sm primary" disabled={busy === 'sync'} onclick={doSync}>
+          <button
+            class="btn sm primary"
+            disabled={busy === 'sync' || busy === 'pull' || busy === 'create'}
+            onclick={doSync}
+          >
             {busy === 'sync' ? '同步中…' : '立即同步'}
           </button>
-          <span class="dim">上次：{cfg.current.github.lastSync || '从未'}</span>
+          <button
+            class="btn sm"
+            disabled={busy === 'sync' || busy === 'pull' || busy === 'create'}
+            onclick={doPull}
+          >
+            {busy === 'pull' ? '下载中…' : '仅下载'}
+          </button>
+          <span class="dim">
+            上次：{cfg.current.github.lastSync ? relTime(cfg.current.github.lastSync, now) : '从未'}
+          </span>
         </div>
+
+        <p class="note">
+          「同步」= 先把远端的更新拿下来，再把本地的改动传上去（换台电脑接着写，点它就行）。
+          「仅下载」只往本地写，远端一个字节都不动。
+        </p>
+
+        <!-- 检查过之后才有话可说：正常 / 空仓库 / 不存在（附建仓入口） -->
+        {#if ghState !== 'idle'}
+          <div
+            class="repoinfo"
+            class:ok={ghState === 'ok'}
+            class:warn={ghState === 'empty'}
+            class:bad={ghState === 'missing'}
+          >
+            {#if ghState === 'ok'}
+              <div class="rl">
+                <Icon name="check" size={13} />
+                <span
+                  ><b>{cfg.current.github.repo}</b> · 分支 {cfg.current.github.branch || 'main'} ·
+                  可以同步</span
+                >
+              </div>
+            {:else if ghState === 'empty'}
+              <div class="rl">
+                <Icon name="info" size={13} />
+                <span>仓库是空的 —— 首次同步会自动建好第一个提交和分支，直接点「立即同步」就行。</span>
+              </div>
+            {:else}
+              <div class="rl">
+                <Icon name="info" size={13} />
+                <span>仓库 <b>{cfg.current.github.repo}</b> 不存在。</span>
+              </div>
+              <div class="rl pick">
+                <input class="field" bind:value={newRepoName} placeholder="仓库名，例如 my-notes" />
+                <button
+                  class="btn sm primary"
+                  disabled={busy === 'create' || !newRepoName.trim()}
+                  onclick={createRepo}
+                >
+                  {busy === 'create' ? '创建中…' : '建为私有仓库'}
+                </button>
+              </div>
+              <div class="rl dim">
+                会在你的账号下建一个<b>私有</b>仓库，然后立刻把 vault 推上去。
+                （同步的是日记和笔记，所以这里不给「公开」这个选项。）
+              </div>
+            {/if}
+          </div>
+        {/if}
 
         <button class="foldhead" onclick={() => (open.gh = !open.gh)}>
           <Icon name={open.gh ? 'chev-d' : 'chev-r'} size={13} />
@@ -530,7 +686,7 @@
                 class="field grow"
                 bind:value={cfg.current.github.repo}
                 onchange={() => saveConfig({})}
-                placeholder="owner/repo"
+                placeholder="owner/repo，或直接粘 GitHub 网址"
               />
             </div>
             <div class="row">
@@ -568,9 +724,40 @@
         {#if report}
           <div class="report">
             <p>
-              提交 <span class="mono">{report.commit || '—'}</span> ·
-              新增/修改 {report.pushed.length} · 删除 {report.deleted.length} · 未变 {report.unchanged}
+              {#if report.commit}提交 <span class="mono">{report.commit}</span> · {/if}
+              下载 {report.pulled.length} · 上传 {report.pushed.length} · 未变 {report.unchanged}
             </p>
+            {#if report.pulled.length}
+              <p class="dim">
+                从远端写入本地 {report.pulled.length} 个：<span class="mono"
+                  >{report.pulled.slice(0, 6).join('、')}</span
+                >{#if report.pulled.length > 6} 等{/if}
+              </p>
+            {/if}
+            {#if report.conflicts.length}
+              <p class="conf">
+                冲突 {report.conflicts.length} 个 —— 两边都改过，<b>本地那份一个字都没动</b>，
+                远端那份另存成了副本，你自己合：
+                {#each report.conflicts.slice(0, 4) as cf}
+                  <br /><span class="mono">{cf.path}</span> → <span class="mono">{cf.savedAs}</span>
+                {/each}
+                {#if report.conflicts.length > 4}<br />…等 {report.conflicts.length} 个{/if}
+              </p>
+            {/if}
+            {#if report.localDeleted.length}
+              <p class="delli">
+                远端删过这 {report.localDeleted.length} 个，本地没动过，所以本地也删了：<span
+                  class="mono">{report.localDeleted.slice(0, 6).join('、')}</span
+                >{#if report.localDeleted.length > 6} 等{/if}
+              </p>
+            {/if}
+            {#if report.deleted.length}
+              <p class="delli">
+                本地删过这 {report.deleted.length} 个，远端没动过，所以远端也删了：<span class="mono"
+                  >{report.deleted.slice(0, 6).join('、')}</span
+                >{#if report.deleted.length > 6} 等{/if}
+              </p>
+            {/if}
             {#if report.skipped.length}
               <p class="dim">跳过 {report.skipped.length} 个：{report.skipped.slice(0, 4).join('、')}</p>
             {/if}
@@ -579,7 +766,8 @@
 
         <p class="note">
           走 Git Data API，<b>一次同步只产生一个 commit</b>，不会把仓库刷成一堆流水账。
-          V1 只做单向上传；远端有你不知道的改动时会直接报错而不是强推。
+          同步是双向的：靠「上次同步的那个提交」当参照，逐文件判断差异是<b>谁</b>造成的 ——
+          只有本地删过、且远端没动过的文件才会被删，别人推上去的东西不会被你顺手清掉。
           {#if !open.gh}<b>要换仓库或更新 Token，展开上面的「仓库配置」。</b>{/if}
         </p>
       </div>
@@ -957,6 +1145,65 @@
     font-size: 11.5px;
     color: var(--accent);
     line-height: 1.7;
+  }
+
+  /* 「远端有、本地没有」的删除项 —— 得比常规报告扎眼，它代表真的少了东西 */
+  .report .delli {
+    margin: 5px 0 0;
+    padding-top: 6px;
+    border-top: 1px dashed var(--line);
+    color: var(--warn);
+  }
+
+  /* 冲突项：两边都动过，得有人来定夺。比常规报告重，但和「删除」区分开 */
+  .report .conf {
+    margin: 5px 0 0;
+    padding-top: 6px;
+    border-top: 1px dashed var(--line);
+    color: var(--fg);
+  }
+  .report .conf b {
+    color: var(--warn);
+    font-weight: 500;
+  }
+
+  /* 仓库连通性回执：正常 / 空仓库 / 不存在，三态用左侧色条区分 */
+  .repoinfo {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-left-width: 2px;
+    border-radius: 8px;
+    background: var(--card);
+    font-size: 11.5px;
+    line-height: 1.7;
+  }
+  .repoinfo .rl {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+  .repoinfo .rl.pick .field {
+    max-width: 220px;
+  }
+  .repoinfo .rl.dim {
+    color: var(--fg-faint);
+    align-items: flex-start;
+  }
+  .repoinfo.ok {
+    border-left-color: var(--accent-2);
+    color: var(--accent-2);
+  }
+  .repoinfo.warn {
+    border-left-color: var(--warn);
+    color: var(--warn);
+  }
+  .repoinfo.bad {
+    border-left-color: var(--danger);
   }
 
   .about {

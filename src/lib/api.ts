@@ -148,7 +148,6 @@ export interface AiConfig {
 export interface GithubConfig {
   repo: string;
   branch: string;
-  autoSync: boolean;
   lastSync: string;
   lastCommit: string;
 }
@@ -187,9 +186,24 @@ export interface AppConfig {
   onboarded: boolean;
 }
 
+export interface ConflictItem {
+  /** 冲突的文件 —— 本地这份原封不动 */
+  path: string;
+  /** 远端那份被另存到了哪儿 */
+  savedAs: string;
+}
+
 export interface SyncReport {
+  /** 从远端写进本地的 */
+  pulled: string[];
+  /** 远端删过、本地没动过 → 本地跟着删掉的 */
+  localDeleted: string[];
+  /** 本地 → 远端 */
   pushed: string[];
+  /** 本地删过、远端没动过 → 远端跟着删掉的 */
   deleted: string[];
+  /** 两边都改了。本地原件未动，远端那份在 savedAs */
+  conflicts: ConflictItem[];
   unchanged: number;
   skipped: string[];
   commit: string;
@@ -203,6 +217,26 @@ export interface RepoInfo {
   defaultBranch: string;
   private: boolean;
   htmlUrl: string;
+  /** 仓库存在但一个提交都没有 —— 首次同步会自动建首个提交，不是错误 */
+  empty: boolean;
+}
+
+export interface AccountInfo {
+  login: string;
+  name: string;
+  /** Token 带的 scope；fine-grained token 拿不到这个头，会是空数组 */
+  scopes: string[];
+}
+
+export interface GhStatus {
+  configured: boolean;
+  /** 自上次同步以来 vault 里有东西动过 */
+  dirty: boolean;
+  repo: string;
+  url: string;
+  branch: string;
+  lastSync: string;
+  lastCommit: string;
 }
 
 export interface AppInfo {
@@ -370,7 +404,21 @@ export const aiTest = (baseUrl?: string, model?: string) =>
 
 // ───────── GitHub ─────────
 
+export const githubAccount = () => invoke<AccountInfo>('github_account');
+export const githubCreateRepo = (name: string, description?: string) =>
+  invoke<RepoInfo>('github_create_repo', { name, description: description ?? null });
+export const githubStatus = () => invoke<GhStatus>('github_status');
 export const githubTest = (repo: string, branch?: string) =>
   invoke<RepoInfo>('github_test', { repo, branch: branch ?? null });
-export const githubSync = (message?: string) =>
-  invoke<SyncReport>('github_sync', { message: message ?? null });
+/**
+ * 双向同步：先拉后推。
+ *
+ * `protect` 是**正在编辑、还没保存**的文档路径 —— 后端对它们只读不写，
+ * 免得把内存里刚敲的字用磁盘内容盖掉。
+ */
+export const githubSync = (protect?: string[], message?: string) =>
+  invoke<SyncReport>('github_sync', { protect: protect ?? null, message: message ?? null });
+
+/** 只下载：把远端更新并进本地，不往远端写一个字节 */
+export const githubPull = (protect?: string[]) =>
+  invoke<SyncReport>('github_pull', { protect: protect ?? null });
